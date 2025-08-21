@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Súkromný AI Chat</title>
+    <!-- Tailwind CSS CDN pre štýly -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Animácia pre tri bodky */
+        @keyframes blink {
+            0% { opacity: 0.2; }
+            20% { opacity: 1; }
+            100% { opacity: 0.2; }
+        }
+        .typing-indicator span {
+            animation: blink 1.4s infinite;
+        }
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+    </style>
+</head>
+<body class="flex flex-col h-screen font-sans antialiased text-gray-900 bg-gray-50 p-4">
+    <!-- Skrytý loading kontajner, keďže inicializácia je okamžitá -->
+    <div id="loading-container" class="hidden"></div>
+    
+    <!-- Hlavný kontajner -->
+    <div class="flex flex-col items-center justify-center p-4 bg-white rounded-xl shadow-lg mb-4">
+        <h1 class="text-4xl font-extrabold text-blue-600">
+            Súkromný AI Chat
+        </h1>
+        <p class="mt-2 text-md text-gray-600">
+            Správy sa ukladajú iba vo vašom prehliadači.
+        </p>
+        <div id="lang-selector" class="mt-4 flex flex-wrap justify-center gap-2">
+            <button id="lang-en" class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-800 hover:bg-gray-300">Anglická</button>
+            <button id="lang-sk" class="px-4 py-2 rounded-lg font-semibold bg-blue-500 text-white">Slovenská</button>
+            <button id="lang-cz" class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-800 hover:bg-gray-300">Česká</button>
+            <button id="lang-ua" class="px-4 py-2 rounded-lg font-semibold bg-gray-200 text-gray-800 hover:bg-gray-300">Ukrajinská</button>
+        </div>
+    </div>
+    
+    <div class="flex-grow overflow-y-auto p-4 bg-white rounded-xl shadow-inner">
+        <div id="chat-box" class="flex flex-col">
+            <!-- Správy budú pridané sem -->
+            <div id="messages-end"></div>
+        </div>
+    </div>
+
+    <div class="mt-4 p-4 bg-white rounded-xl shadow-lg flex flex-col sm:flex-row items-center gap-4">
+        <form id="message-form" class="flex flex-grow w-full gap-2">
+            <input
+                type="text"
+                id="user-input"
+                class="flex-grow px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="Napíš správu..."
+            />
+            <button
+                type="submit"
+                id="send-button"
+                class="px-6 py-2 rounded-lg font-bold text-white transition-colors duration-200 bg-blue-600 hover:bg-blue-700"
+            >
+                Odoslať
+            </button>
+        </form>
+        <button
+            id="start-ai-button"
+            class="px-6 py-2 rounded-lg font-bold text-white transition-colors duration-200 whitespace-nowrap bg-purple-600 hover:bg-purple-700"
+        >
+            Spustiť AI chat
+        </button>
+    </div>
+
+    <script>
+        // Global variables
+        let language = 'sk'; // Default language
+        let userId = 'local-user'; // Fixed ID for local user
+
+        // DOM elements
+        let messagesEndRef;
+        let chatBox;
+        let userInput;
+        let sendButton;
+        let startAiButton;
+        let isAITalking = false;
+
+        // --- GEMINI API CALL (for AI responses) ---
+        const generateAIResponse = async (prompt) => {
+            const chatHistory = [{ role: 'user', parts: [{ text: prompt }] }];
+            const payload = { contents: chatHistory };
+            const apiKey = "AIzaSyD0OIR4P5gjUBvVJfWUSYZmQGck_aKoVv8";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+            let responseData = null;
+            let retryCount = 0;
+            const maxRetries = 5;
+
+            while (retryCount < maxRetries) {
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+
+                    if (response.ok) {
+                        responseData = await response.json();
+                        break; // Success, exit loop
+                    } else {
+                        console.error(`API call failed with status: ${response.status}. Response: ${await response.text()}`);
+                        throw new Error(`API call failed with status: ${response.status}`);
+                    }
+                } catch (error) {
+                    console.error(`Attempt ${retryCount + 1} failed:`, error);
+                    retryCount++;
+                    await new Promise(resolve => setTimeout(resolve, Math.pow(2, retryCount) * 1000));
+                }
+            }
+            return responseData?.candidates?.[0]?.content?.parts?.[0]?.text;
+        };
+
+        // --- FUNCTION TO LOAD MESSAGES FROM LOCAL STORAGE ---
+        const getMessagesFromLocal = () => {
+            const storedMessages = localStorage.getItem(`chat_messages_${language}`);
+            return storedMessages ? JSON.parse(storedMessages) : [];
+        };
+
+        // --- FUNCTION TO SAVE MESSAGES TO LOCAL STORAGE ---
+        const saveMessagesToLocal = (messages) => {
+            localStorage.setItem(`chat_messages_${language}`, JSON.stringify(messages));
+        };
+
+        // --- FUNCTION TO SEND A MESSAGE ---
+        const sendMessage = async (e) => {
+            e.preventDefault();
+            if (userInput.value.trim() === '') return;
+
+            // Set loading state for user's send button only
+            setLoading(true);
+
+            try {
+                const messages = getMessagesFromLocal();
+                const messageData = {
+                    userId: userId,
+                    text: userInput.value,
+                    timestamp: new Date().getTime(),
+                    sender: 'human'
+                };
+                messages.push(messageData);
+                saveMessagesToLocal(messages);
+                renderMessages(messages);
+                userInput.value = '';
+
+                // Trigger AI response after user sends message
+                const aiResponsePrompt = `Jazyk je ${language}. Si AI. Odpovedz na túto správu: "${messageData.text}". Píš stručne, s maximálnou dĺžkou 100 slov a v danom jazyku.`;
+                const aiResponse = await generateAIResponse(aiResponsePrompt);
+                if (aiResponse) {
+                    const aiMessages = getMessagesFromLocal();
+                    const aiMessageData = {
+                        userId: 'gemini-ai-1',
+                        text: aiResponse,
+                        timestamp: new Date().getTime() + 1,
+                        sender: 'ai'
+                    };
+                    aiMessages.push(aiMessageData);
+                    saveMessagesToLocal(aiMessages);
+                    renderMessages(aiMessages);
+                }
+            } catch (e) {
+                console.error("Error adding document: ", e);
+            } finally {
+                setLoading(false);
+            }
+        };
+        
+        // --- TYPING INDICATOR FUNCTIONS ---
+        const showTypingIndicator = () => {
+            const indicatorDiv = document.createElement('div');
+            indicatorDiv.id = 'typing-indicator';
+            indicatorDiv.className = 'flex items-center space-x-1 p-3 rounded-lg my-2 max-w-lg bg-gray-100 self-start';
+            indicatorDiv.innerHTML = `<div class="font-bold text-sm text-gray-700">AI píše...</div><span class="typing-indicator text-lg text-gray-500"><span class="inline-block w-2 h-2 bg-gray-500 rounded-full"></span><span class="inline-block w-2 h-2 bg-gray-500 rounded-full"></span><span class="inline-block w-2 h-2 bg-gray-500 rounded-full"></span></span>`;
+            chatBox.appendChild(indicatorDiv);
+            scrollToBottom();
+        };
+
+        const hideTypingIndicator = () => {
+            const indicator = document.getElementById('typing-indicator');
+            if (indicator) {
+                indicator.remove();
+            }
+        };
+
+        // --- RECURSIVE AI-TO-AI CONVERSATION ---
+        const startAIConversation = async () => {
+            if (isAITalking) return;
+            isAITalking = true;
+            
+            // Disable start button while AI is talking
+            startAiButton.classList.add('bg-gray-400', 'cursor-not-allowed');
+            startAiButton.classList.remove('bg-purple-600', 'hover:bg-purple-700');
+            startAiButton.disabled = true;
+
+            const chatTurn = async (speaker, lastText) => {
+                if (!lastText) {
+                    isAITalking = false;
+                    startAiButton.classList.remove('bg-gray-400', 'cursor-not-allowed');
+                    startAiButton.classList.add('bg-purple-600', 'hover:bg-purple-700');
+                    startAiButton.disabled = false;
+                    return;
+                }
+                
+                hideTypingIndicator(); // Hide any previous typing indicator
+                showTypingIndicator(); // Show typing indicator for the current AI
+
+                const prompt = `Tvoj jazyk je ${language}. Si AI agent ${speaker === 'gemini-ai-1' ? '1' : '2'}. Odpovedz na túto správu: "${lastText}". Píš stručne a neustále pokračuj v konverzácii.`;
+                const response = await generateAIResponse(prompt);
+
+                hideTypingIndicator(); // Hide typing indicator after response is received
+
+                if (response) {
+                    const messages = getMessagesFromLocal();
+                    const messageData = {
+                        userId: speaker,
+                        text: response,
+                        timestamp: new Date().getTime(),
+                        sender: 'ai'
+                    };
+                    messages.push(messageData);
+                    saveMessagesToLocal(messages);
+                    renderMessages(messages);
+
+                    // Prepare for next turn
+                    const nextSpeaker = speaker === 'gemini-ai-1' ? 'gemini-ai-2' : 'gemini-ai-1';
+                    
+                    // Recursive call for next turn with a 1-second delay
+                    setTimeout(() => chatTurn(nextSpeaker, response), 1000);
+                } else {
+                     isAITalking = false;
+                     startAiButton.classList.remove('bg-gray-400', 'cursor-not-allowed');
+                     startAiButton.classList.add('bg-purple-600', 'hover:bg-purple-700');
+                     startAiButton.disabled = false;
+                }
+            };
+            
+            // Start the first turn of the conversation
+            let initialPrompt = `Ahoj, som AI agent 1. Chcel by som sa s tebou porozprávať.`;
+            chatTurn('gemini-ai-1', initialPrompt);
+        };
+
+        // --- UI RENDERING AND LOGIC ---
+        const renderMessages = (messages) => {
+            chatBox.innerHTML = '';
+            messages.forEach(msg => {
+                const isHuman = msg.sender === 'human';
+                const messageClass = isHuman ? 'bg-blue-100 self-end' : 'bg-gray-100 self-start';
+                const senderName = isHuman ? 'Ja' : (msg.userId === 'gemini-ai-1' ? 'AI Agent 1' : 'AI Agent 2');
+
+                const msgDiv = document.createElement('div');
+                msgDiv.className = `p-3 rounded-lg my-2 max-w-lg ${messageClass}`;
+
+                // Add green dot for AI agents
+                const dotHtml = !isHuman ? `<span class="inline-block w-2 h-2 mr-1 bg-green-500 rounded-full"></span>` : '';
+                msgDiv.innerHTML = `<div class="font-bold text-sm text-gray-700 flex items-center">${dotHtml}${senderName}</div><p class="text-gray-800">${msg.text}</p>`;
+
+                chatBox.appendChild(msgDiv);
+            });
+            scrollToBottom();
+        };
+
+        const scrollToBottom = () => {
+            messagesEndRef.scrollIntoView({ behavior: 'smooth' });
+        };
+
+        const setLoading = (state) => {
+            sendButton.disabled = state;
+            userInput.disabled = state;
+
+            if (state) {
+                sendButton.classList.add('bg-blue-300', 'cursor-not-allowed');
+                sendButton.classList.remove('bg-blue-600', 'hover:bg-blue-700');
+            } else {
+                sendButton.classList.remove('bg-blue-300', 'cursor-not-allowed');
+                sendButton.classList.add('bg-blue-600', 'hover:bg-blue-700');
+            }
+        };
+
+        const switchLanguage = (newLang) => {
+            if (language === newLang) return;
+            language = newLang;
+            setLoading(true);
+            chatBox.innerHTML = '';
+            document.querySelectorAll('#lang-selector button').forEach(btn => {
+                btn.classList.remove('bg-blue-500', 'text-white');
+                btn.classList.add('bg-gray-200', 'text-gray-800');
+            });
+            document.getElementById(`lang-${newLang}`).classList.remove('bg-gray-200', 'text-gray-800');
+            document.getElementById(`lang-${newLang}`).classList.add('bg-blue-500', 'text-white');
+            
+            // Load messages for the new language
+            const messages = getMessagesFromLocal();
+            renderMessages(messages);
+            startAIConversation();
+        };
+
+        // --- INITIAL SETUP ON PAGE LOAD ---
+        window.onload = function() {
+            // Get DOM element references
+            messagesEndRef = document.getElementById('messages-end');
+            chatBox = document.getElementById('chat-box');
+            userInput = document.getElementById('user-input');
+            sendButton = document.getElementById('send-button');
+            startAiButton = document.getElementById('start-ai-button');
+
+            // Add event listeners
+            document.getElementById('message-form').addEventListener('submit', sendMessage);
+            startAiButton.addEventListener('click', startAIConversation);
+
+            document.getElementById('lang-en').addEventListener('click', () => switchLanguage('en'));
+            document.getElementById('lang-sk').addEventListener('click', () => switchLanguage('sk'));
+            document.getElementById('lang-cz').addEventListener('click', () => switchLanguage('cz'));
+            document.getElementById('lang-ua').addEventListener('click', () => switchLanguage('ua'));
+
+            // Load initial messages
+            const messages = getMessagesFromLocal();
+            renderMessages(messages);
+
+            // Start AI conversation automatically
+            startAIConversation();
+        };
+    </script>
+</body>
+</html>
